@@ -1,5 +1,5 @@
 /*
- * (C) Copyright 2006-2011 Nuxeo SA (http://nuxeo.com/) and others.
+ * (C) Copyright 2006-2016 Nuxeo SA (http://nuxeo.com/) and others.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,7 +46,6 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
 import org.apache.chemistry.opencmis.client.api.ObjectId;
-import org.apache.chemistry.opencmis.client.api.ObjectType;
 import org.apache.chemistry.opencmis.client.api.OperationContext;
 import org.apache.chemistry.opencmis.client.api.Policy;
 import org.apache.chemistry.opencmis.client.runtime.ObjectIdImpl;
@@ -83,7 +82,6 @@ import org.apache.chemistry.opencmis.commons.enums.RelationshipDirection;
 import org.apache.chemistry.opencmis.commons.enums.UnfileObject;
 import org.apache.chemistry.opencmis.commons.enums.Updatability;
 import org.apache.chemistry.opencmis.commons.enums.VersioningState;
-import org.apache.chemistry.opencmis.commons.exceptions.CmisBaseException;
 import org.apache.chemistry.opencmis.commons.exceptions.CmisConstraintException;
 import org.apache.chemistry.opencmis.commons.exceptions.CmisContentAlreadyExistsException;
 import org.apache.chemistry.opencmis.commons.exceptions.CmisInvalidArgumentException;
@@ -105,6 +103,7 @@ import org.apache.chemistry.opencmis.commons.impl.dataobjects.ObjectListImpl;
 import org.apache.chemistry.opencmis.commons.impl.dataobjects.ObjectParentDataImpl;
 import org.apache.chemistry.opencmis.commons.impl.dataobjects.PropertiesImpl;
 import org.apache.chemistry.opencmis.commons.impl.dataobjects.PropertyIdImpl;
+import org.apache.chemistry.opencmis.commons.impl.dataobjects.PropertyStringImpl;
 import org.apache.chemistry.opencmis.commons.impl.jaxb.CmisTypeContainer;
 import org.apache.chemistry.opencmis.commons.impl.server.AbstractCmisService;
 import org.apache.chemistry.opencmis.commons.server.CallContext;
@@ -118,6 +117,13 @@ import org.apache.chemistry.opencmis.server.support.wrapper.CallContextAwareCmis
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.elasticsearch.action.search.SearchRequestBuilder;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.action.search.SearchType;
+import org.elasticsearch.index.query.BoolQueryBuilder;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.sort.SortOrder;
 import org.nuxeo.common.utils.Path;
 import org.nuxeo.ecm.core.api.Blob;
 import org.nuxeo.ecm.core.api.Blobs;
@@ -142,7 +148,6 @@ import org.nuxeo.ecm.core.api.security.ACE;
 import org.nuxeo.ecm.core.api.security.ACL;
 import org.nuxeo.ecm.core.api.security.ACP;
 import org.nuxeo.ecm.core.api.security.SecurityConstants;
-import org.nuxeo.ecm.core.io.download.DownloadService;
 import org.nuxeo.ecm.core.opencmis.impl.util.ListUtils;
 import org.nuxeo.ecm.core.opencmis.impl.util.ListUtils.BatchedList;
 import org.nuxeo.ecm.core.opencmis.impl.util.SimpleImageInfo;
@@ -154,14 +159,19 @@ import org.nuxeo.ecm.core.security.SecurityService;
 import org.nuxeo.ecm.core.storage.sql.coremodel.SQLDocumentVersion.VersionNotModifiableException;
 import org.nuxeo.ecm.platform.audit.api.AuditReader;
 import org.nuxeo.ecm.platform.audit.api.LogEntry;
+import org.nuxeo.ecm.platform.audit.service.DefaultAuditBackend;
 import org.nuxeo.ecm.platform.filemanager.api.FileManager;
 import org.nuxeo.ecm.platform.mimetype.MimetypeNotFoundException;
-import org.nuxeo.ecm.platform.mimetype.interfaces.MimetypeEntry;
 import org.nuxeo.ecm.platform.mimetype.interfaces.MimetypeRegistry;
 import org.nuxeo.ecm.platform.mimetype.service.MimetypeRegistryService;
 import org.nuxeo.ecm.platform.rendition.Rendition;
 import org.nuxeo.ecm.platform.rendition.service.RenditionService;
+import org.nuxeo.elasticsearch.ElasticSearchConstants;
+import org.nuxeo.elasticsearch.api.ElasticSearchAdmin;
 import org.nuxeo.elasticsearch.api.ElasticSearchService;
+import org.nuxeo.elasticsearch.api.EsIterableQueryResultImpl;
+import org.nuxeo.elasticsearch.audit.ESAuditBackend;
+import org.nuxeo.elasticsearch.audit.io.AuditEntryJSONReader;
 import org.nuxeo.elasticsearch.query.NxQueryBuilder;
 import org.nuxeo.runtime.api.Framework;
 import org.nuxeo.runtime.transaction.TransactionHelper;
@@ -169,8 +179,8 @@ import org.nuxeo.runtime.transaction.TransactionHelper;
 /**
  * Nuxeo implementation of the CMIS Services, on top of a {@link CoreSession}.
  */
-public class NuxeoCmisService extends AbstractCmisService implements CallContextAwareCmisService,
-        ProgressControlCmisService {
+public class NuxeoCmisService extends AbstractCmisService
+        implements CallContextAwareCmisService, ProgressControlCmisService {
 
     public static final int DEFAULT_TYPE_LEVELS = 2;
 
@@ -187,6 +197,15 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
     public static final int DEFAULT_MAX_RELATIONSHIPS = 100;
 
     public static final String PERMISSION_NOTHING = "Nothing";
+
+    /** Synthetic property for change log entries recording the log entry id. */
+    public static final String NX_CHANGE_LOG_ID = "nuxeo:changeLogId";
+
+    public static final String ES_AUDIT_ID = "id";
+
+    public static final String ES_AUDIT_REPOSITORY_ID = "repositoryId";
+
+    public static final String ES_AUDIT_EVENT_ID = "eventId";
 
     private static final Log log = LogFactory.getLog(NuxeoCmisService.class);
 
@@ -363,7 +382,7 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
     @Override
     public List<RepositoryInfo> getRepositoryInfos(ExtensionsData extension) {
         List<NuxeoRepository> repos = Framework.getService(NuxeoRepositories.class).getRepositories();
-        List<RepositoryInfo> infos = new ArrayList<RepositoryInfo>(repos.size());
+        List<RepositoryInfo> infos = new ArrayList<>(repos.size());
         for (NuxeoRepository repo : repos) {
             String latestChangeLogToken = getLatestChangeLogToken(repo.getId());
             infos.add(repo.getRepositoryInfo(latestChangeLogToken, callContext));
@@ -414,7 +433,7 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
                 includePropertyDefinitions);
         // clone
         // TODO copy only when local binding
-        List<CmisTypeContainer> tmp = new ArrayList<CmisTypeContainer>(types.size());
+        List<CmisTypeContainer> tmp = new ArrayList<>(types.size());
         WSConverter.convertTypeContainerList(types, tmp);
         return WSConverter.convertTypeContainerList(tmp);
     }
@@ -718,7 +737,8 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
     public String create(String repositoryId, Properties properties, String folderId, ContentStream contentStream,
             VersioningState versioningState, List<String> policies, ExtensionsData extension) {
         // TODO policies
-        NuxeoObjectData object = createObject(repositoryId, properties, new ObjectIdImpl(folderId), null, contentStream);
+        NuxeoObjectData object = createObject(repositoryId, properties, new ObjectIdImpl(folderId), null,
+                contentStream);
         return setInitialVersioningState(object, versioningState);
     }
 
@@ -755,8 +775,8 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
     }
 
     @Override
-    public String createDocumentFromSource(String repositoryId, String sourceId, Properties properties,
-            String folderId, VersioningState versioningState, List<String> policies, Acl addAces, Acl removeAces,
+    public String createDocumentFromSource(String repositoryId, String sourceId, Properties properties, String folderId,
+            VersioningState versioningState, List<String> policies, Acl addAces, Acl removeAces,
             ExtensionsData extension) {
         if (folderId == null) {
             // no unfileable objects for now
@@ -1016,7 +1036,7 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
 
     protected Map<String, ObjectInfo> getObjectInfo() {
         if (objectInfos == null) {
-            objectInfos = new HashMap<String, ObjectInfo>();
+            objectInfos = new HashMap<>();
         }
         return objectInfos;
     }
@@ -1117,12 +1137,11 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
     public List<BulkUpdateObjectIdAndChangeToken> bulkUpdateProperties(String repositoryId,
             List<BulkUpdateObjectIdAndChangeToken> objectIdAndChangeToken, Properties properties,
             List<String> addSecondaryTypeIds, List<String> removeSecondaryTypeIds, ExtensionsData extension) {
-        List<BulkUpdateObjectIdAndChangeToken> list = new ArrayList<BulkUpdateObjectIdAndChangeToken>(
-                objectIdAndChangeToken.size());
+        List<BulkUpdateObjectIdAndChangeToken> list = new ArrayList<>(objectIdAndChangeToken.size());
         for (BulkUpdateObjectIdAndChangeToken idt : objectIdAndChangeToken) {
             String id = idt.getId();
-            Holder<String> objectIdHolder = new Holder<String>(id);
-            Holder<String> changeTokenHolder = new Holder<String>(idt.getChangeToken());
+            Holder<String> objectIdHolder = new Holder<>(id);
+            Holder<String> changeTokenHolder = new Holder<>(idt.getChangeToken());
             updateProperties(objectIdHolder, changeTokenHolder, properties);
             list.add(new BulkUpdateObjectIdAndChangeTokenImpl(id, objectIdHolder.getValue(),
                     changeTokenHolder.getValue()));
@@ -1240,25 +1259,21 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
 
     @Override
     public ObjectList getContentChanges(String repositoryId, Holder<String> changeLogTokenHolder,
-            Boolean includeProperties, String filter, Boolean includePolicyIds, Boolean includeAcl,
-            BigInteger maxItems, ExtensionsData extension) {
+            Boolean includeProperties, String filter, Boolean includePolicyIds, Boolean includeAcl, BigInteger maxItems,
+            ExtensionsData extension) {
         if (changeLogTokenHolder == null) {
             throw new CmisInvalidArgumentException("Missing change log token holder");
         }
         String changeLogToken = changeLogTokenHolder.getValue();
-        long minDate;
+        long minId;
         if (changeLogToken == null) {
-            minDate = 0;
+            minId = 0;
         } else {
             try {
-                minDate = Long.parseLong(changeLogToken);
+                minId = Long.parseLong(changeLogToken);
             } catch (NumberFormatException e) {
                 throw new CmisInvalidArgumentException("Invalid change log token");
             }
-        }
-        AuditReader reader = Framework.getService(AuditReader.class);
-        if (reader == null) {
-            throw new CmisRuntimeException("Cannot find audit service");
         }
         int max = maxItems == null ? -1 : maxItems.intValue();
         if (max <= 0) {
@@ -1275,7 +1290,7 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
             if (pageSize < 0) { // overflow
                 pageSize = Integer.MAX_VALUE;
             }
-            ods = readAuditLog(repositoryId, minDate, max, pageSize);
+            ods = readAuditLog(repositoryId, minId, max, pageSize);
             if (ods != null) {
                 break;
             }
@@ -1297,7 +1312,7 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
             latestChangeLogToken = null;
         } else {
             ObjectData last = ods.get(ods.size() - 1);
-            latestChangeLogToken = String.valueOf(last.getChangeEventInfo().getChangeTime().getTimeInMillis());
+            latestChangeLogToken = (String) last.getProperties().getProperties().get(NX_CHANGE_LOG_ID).getFirstValue();
         }
         ObjectListImpl ol = new ObjectListImpl();
         ol.setHasMoreItems(Boolean.valueOf(hasMoreItems));
@@ -1307,31 +1322,62 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
         return ol;
     }
 
+    protected SearchRequestBuilder getElasticsearchBuilder() {
+        ElasticSearchAdmin esa = Framework.getService(ElasticSearchAdmin.class);
+        String indexName = esa.getIndexNameForType(ElasticSearchConstants.ENTRY_TYPE);
+        return esa.getClient().prepareSearch(indexName).setTypes(ElasticSearchConstants.ENTRY_TYPE).setSearchType(
+                SearchType.DFS_QUERY_THEN_FETCH);
+    }
+
     /**
      * Reads at most max+1 entries from the audit log.
      *
      * @return null if not enough elements found with the current page size
      */
-    protected List<ObjectData> readAuditLog(String repositoryId, long minDate, int max, int pageSize) {
+    protected List<ObjectData> readAuditLog(String repositoryId, long minId, int max, int pageSize) {
         AuditReader reader = Framework.getLocalService(AuditReader.class);
         if (reader == null) {
             throw new CmisRuntimeException("Cannot find audit service");
         }
-        List<ObjectData> ods = new ArrayList<ObjectData>();
-        String query = "FROM LogEntry log" //
-                + " WHERE log.eventDate >= :minDate" //
-                + "   AND log.eventId IN (:evCreated, :evModified, :evRemoved)" //
-                + "   AND log.repositoryId = :repoId" //
-                + " ORDER BY log.eventDate";
-        Map<String, Object> params = new HashMap<String, Object>();
-        params.put("minDate", new Date(minDate));
-        params.put("evCreated", DOCUMENT_CREATED);
-        params.put("evModified", DOCUMENT_UPDATED);
-        params.put("evRemoved", DOCUMENT_REMOVED);
-        params.put("repoId", repositoryId);
-        List<?> entries = reader.nativeQuery(query, params, 1, pageSize);
-        for (Object entry : entries) {
-            ObjectData od = getLogEntryObjectData((LogEntry) entry);
+        List<LogEntry> entries;
+        if (reader instanceof DefaultAuditBackend) {
+            String query = "FROM LogEntry log" //
+                    + " WHERE log.id >= :minId" //
+                    + "   AND log.eventId IN (:evCreated, :evModified, :evRemoved)" //
+                    + "   AND log.repositoryId = :repoId" //
+                    + " ORDER BY log.id";
+            Map<String, Object> params = new HashMap<>();
+            params.put("minId", Long.valueOf(minId));
+            params.put("evCreated", DOCUMENT_CREATED);
+            params.put("evModified", DOCUMENT_UPDATED);
+            params.put("evRemoved", DOCUMENT_REMOVED);
+            params.put("repoId", repositoryId);
+            entries = (List<LogEntry>) reader.nativeQuery(query, params, 1, pageSize);
+        } else if (reader instanceof ESAuditBackend) {
+            SearchRequestBuilder builder = getElasticsearchBuilder();
+            BoolQueryBuilder query = QueryBuilders.boolQuery()
+                                                  .must(QueryBuilders.matchAllQuery())
+                                                  .filter(QueryBuilders.termQuery(ES_AUDIT_REPOSITORY_ID, repositoryId))
+                                                  .filter(QueryBuilders.termsQuery(ES_AUDIT_EVENT_ID, DOCUMENT_CREATED,
+                                                          DOCUMENT_UPDATED, DOCUMENT_REMOVED))
+                                                  .filter(QueryBuilders.rangeQuery(ES_AUDIT_ID).gte(minId));
+            builder.setQuery(query);
+            builder.addSort(ES_AUDIT_ID, SortOrder.ASC);
+            entries = new ArrayList<>();
+            SearchResponse searchResponse = builder.setSize(pageSize).execute().actionGet();
+            for (SearchHit hit : searchResponse.getHits()) {
+                try {
+                    entries.add(AuditEntryJSONReader.read(hit.getSourceAsString()));
+                } catch (IOException e) {
+                    throw new CmisRuntimeException("Failed to parse audit entry: " + hit, e);
+                }
+            }
+        } else {
+            throw new CmisRuntimeException("Unknown audit backend: " + reader.getClass().getName());
+        }
+        List<ObjectData> ods = new ArrayList<>();
+        for (LogEntry entry : entries) {
+            ObjectData od = getLogEntryObjectData(entry);
             if (od != null) {
                 ods.add(od);
                 if (ods.size() > max) {
@@ -1377,10 +1423,11 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
         cei.setChangeTime(changeTime);
         ObjectDataImpl od = new ObjectDataImpl();
         od.setChangeEventInfo(cei);
-        // properties: id, doc type
+        // properties: id, doc type, change log id
         PropertiesImpl properties = new PropertiesImpl();
         properties.addProperty(new PropertyIdImpl(PropertyIds.OBJECT_ID, logEntry.getDocUUID()));
         properties.addProperty(new PropertyIdImpl(PropertyIds.OBJECT_TYPE_ID, docType));
+        properties.addProperty(new PropertyStringImpl(NX_CHANGE_LOG_ID, String.valueOf(logEntry.getId())));
         od.setProperties(properties);
         return od;
     }
@@ -1392,15 +1439,47 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
             return "0";
             // throw new CmisRuntimeException("Cannot find audit service");
         }
-        // TODO XXX repositoryId as well
-        String[] events = new String[] { DOCUMENT_CREATED, DOCUMENT_UPDATED, DOCUMENT_REMOVED };
-        String[] category = null;
-        List<?> entries = reader.queryLogsByPage(events, new Date(0), category, null, 1, 1);
-        if (entries.size() == 0) {
-            return "0";
+        long id;
+        if (reader instanceof DefaultAuditBackend) {
+            String query = "FROM LogEntry log" //
+                    + " WHERE log.eventId IN (:evCreated, :evModified, :evRemoved)" //
+                    + "   AND log.repositoryId = :repoId" //
+                    + " ORDER BY log.id DESC";
+            Map<String, Object> params = new HashMap<>();
+            params.put("evCreated", DOCUMENT_CREATED);
+            params.put("evModified", DOCUMENT_UPDATED);
+            params.put("evRemoved", DOCUMENT_REMOVED);
+            params.put("repoId", repositoryId);
+            @SuppressWarnings("unchecked")
+            List<LogEntry> entries = (List<LogEntry>) reader.nativeQuery(query, params, 1, 1);
+            id = entries.isEmpty() ? 0 : entries.get(0).getId();
+        } else if (reader instanceof ESAuditBackend) {
+            SearchRequestBuilder builder = getElasticsearchBuilder();
+            BoolQueryBuilder query = QueryBuilders.boolQuery()
+                                                  .must(QueryBuilders.matchAllQuery())
+                                                  .filter(QueryBuilders.termQuery(ES_AUDIT_REPOSITORY_ID, repositoryId))
+                                                  .filter(QueryBuilders.termsQuery(ES_AUDIT_EVENT_ID, DOCUMENT_CREATED,
+                                                          DOCUMENT_UPDATED, DOCUMENT_REMOVED));
+            builder.setQuery(query);
+            builder.addSort(ES_AUDIT_ID, SortOrder.DESC);
+            builder.setSize(1);
+            // TODO refactor this to use max clause
+            SearchResponse searchResponse = builder.execute().actionGet();
+            SearchHit[] hits = searchResponse.getHits().hits();
+            if (hits.length == 0) {
+                id = 0;
+            } else {
+                String hit = hits[0].getSourceAsString();
+                try {
+                    id = AuditEntryJSONReader.read(hit).getId();
+                } catch (IOException e) {
+                    throw new CmisRuntimeException("Failed to parse audit entry: " + hit, e);
+                }
+            }
+        } else {
+            throw new CmisRuntimeException("Unknown audit backend: " + reader.getClass().getName());
         }
-        LogEntry logEntry = (LogEntry) entries.get(0);
-        return String.valueOf(logEntry.getEventDate().getTime());
+        return String.valueOf(id);
     }
 
     protected String addProxyClause(String query) {
@@ -1426,12 +1505,12 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
         List<ObjectData> list;
         IterableQueryResult res = null;
         try {
-            Map<String, PropertyDefinition<?>> typeInfo = new HashMap<String, PropertyDefinition<?>>();
+            Map<String, PropertyDefinition<?>> typeInfo = new HashMap<>();
             // searchAllVersions defaults to false, spec 2.2.6.1.1
             res = queryAndFetch(statement, Boolean.TRUE.equals(searchAllVersions), typeInfo);
 
             // convert from Nuxeo to CMIS format
-            list = new ArrayList<ObjectData>();
+            list = new ArrayList<>();
             if (skip > 0) {
                 res.skipTo(skip);
             }
@@ -1458,8 +1537,8 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
                         if (doc == null) {
                             doc = getDocumentModel(id);
                         }
-                        List<RenditionData> renditions = NuxeoObjectData.getRenditions(doc, renditionFilter, null,
-                                null, callContext);
+                        List<RenditionData> renditions = NuxeoObjectData.getRenditions(doc, renditionFilter, null, null,
+                                callContext);
                         od.setRenditions(renditions);
                     }
                 }
@@ -1519,8 +1598,10 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
             try {
                 if (repository.useElasticsearch()) {
                     ElasticSearchService ess = Framework.getService(ElasticSearchService.class);
-                    NxQueryBuilder qb = new NxQueryBuilder(coreSession).nxql(nxql).limit(-1);
-                    it = ess.queryAndAggregate(qb).getRows();
+                    NxQueryBuilder qb = new NxQueryBuilder(coreSession).nxql(nxql)
+                                                                       .limit(1000)
+                                                                       .onlyElasticsearchResponse();
+                    it = new EsIterableQueryResultImpl(ess, ess.scroll(qb, 1000));
                 } else {
                     // distinct documents
                     it = coreSession.queryAndFetch(nxql, NXQL.NXQL, true, new Object[0]);
@@ -1549,7 +1630,8 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
         return queryAndFetch(query, searchAllVersions, null);
     }
 
-    protected ObjectDataImpl makeObjectData(Map<String, Serializable> map, Map<String, PropertyDefinition<?>> typeInfo) {
+    protected ObjectDataImpl makeObjectData(Map<String, Serializable> map,
+            Map<String, PropertyDefinition<?>> typeInfo) {
         ObjectDataImpl od = new ObjectDataImpl();
         PropertiesImpl properties = new PropertiesImpl();
         for (Entry<String, Serializable> en : map.entrySet()) {
@@ -1577,7 +1659,8 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
     }
 
     @Override
-    public void removeObjectFromFolder(String repositoryId, String objectId, String folderId, ExtensionsData extension) {
+    public void removeObjectFromFolder(String repositoryId, String objectId, String folderId,
+            ExtensionsData extension) {
         if (folderId != null) {
             // check it's the actual parent
             DocumentModel folder = getDocumentModel(folderId);
@@ -1605,7 +1688,7 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
             String renditionFilter, Boolean includePathSegment, BigInteger maxItems, BigInteger skipCount,
             boolean folderOnly) {
         ObjectInFolderListImpl result = new ObjectInFolderListImpl();
-        List<ObjectInFolderData> list = new ArrayList<ObjectInFolderData>();
+        List<ObjectInFolderData> list = new ArrayList<>();
         DocumentModel folder = getDocumentModel(folderId);
         if (!folder.isFolder()) {
             return null;
@@ -1698,13 +1781,12 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
         if (maxLevels != -1 && level >= maxLevels) {
             return null;
         }
-        ObjectInFolderList children = getChildrenInternal(repositoryId, folderId, filter, null,
-                includeAllowableActions, includeRelationships, renditionFilter, includePathSegments, null, null,
-                folderOnly);
+        ObjectInFolderList children = getChildrenInternal(repositoryId, folderId, filter, null, includeAllowableActions,
+                includeRelationships, renditionFilter, includePathSegments, null, null, folderOnly);
         if (children == null) {
             return Collections.emptyList();
         }
-        List<ObjectInFolderContainer> res = new ArrayList<ObjectInFolderContainer>(children.getObjects().size());
+        List<ObjectInFolderContainer> res = new ArrayList<>(children.getObjects().size());
         for (ObjectInFolderData child : children.getObjects()) {
             ObjectInFolderContainerImpl oifc = new ObjectInFolderContainerImpl();
             oifc.setObject(child);
@@ -1937,7 +2019,7 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
             // same as query names
         }
         // clause from folderId
-        List<String> clauses = new ArrayList<String>(3);
+        List<String> clauses = new ArrayList<>(3);
         clauses.add(NuxeoTypeHelper.NX_ISVERSION + " = false");
         clauses.add(NuxeoTypeHelper.NX_ISCHECKEDIN + " = false");
         if (folderId != null) {
@@ -1974,7 +2056,7 @@ public class NuxeoCmisService extends AbstractCmisService implements CallContext
             throw new CmisInvalidArgumentException("Missing object ID or version series ID");
         }
         List<DocumentRef> versions = coreSession.getVersionsRefs(doc.getRef());
-        List<ObjectData> list = new ArrayList<ObjectData>(versions.size());
+        List<ObjectData> list = new ArrayList<>(versions.size());
         for (DocumentRef verRef : versions) {
             String verId = getIdFromDocumentRef(verRef);
             ObjectData od = getObject(repositoryId, verId, filter, includeAllowableActions, IncludeRelationships.NONE,
